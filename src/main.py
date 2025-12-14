@@ -1,17 +1,42 @@
-import asyncio
-import json
-import struct
+import multiprocessing
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from MoMaFkSolver.core import FastBVH
 from MoMaFkSolver.player import AnimationPlayer
+from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
-# Importations basées sur votre structure de fichiers
+from animators.fk_animator import SimpleFKAnimator
+from core.session_manager import SessionManager
 
-app = FastAPI()
+# Singleton for session management
+manager = SessionManager()
+
+
+# Data model for session creation request
+class SessionCreateRequest(BaseModel):
+    session_id: str
+    animation_file: str  # ex: "Walking.fbx"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # On Startup Event
+    # Initialisation si nécessaire
+    # <...>
+
+    yield
+
+    # On Shutdown Event
+    for session_id in list(manager.sessions.keys()):
+        await manager.delete_session(session_id)
+
+
+app = FastAPI(title="MoMa Animation Streamer")
 
 # Ceci autorise toutes les origines, toutes les méthodes et tous les headers.
 # Pour la prod, remplacez ["*"] par ["http://localhost:5173"]
@@ -23,32 +48,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- API REST ---
+
 # 1. Chargement de l'animation au démarrage du serveur
 # On utilise la logique vue dans tests/test.py pour localiser le fichier
-BVH_PATH = Path("animations/07_01.bvh")
+BVH_PATH = Path("../assets/animations/07_01.bvh")
 
 print(f"Chargement de l'animation depuis : {BVH_PATH}")
 # On charge l'animation en mémoire une seule fois (Singleton pattern implicite)
 anim_data = FastBVH(str(BVH_PATH))
 
 
-@app.get("/")
-async def root():
-    return {
-        "message": "MM Server Reforged est en ligne. Utilisez /ws pour le streaming."
-    }
+@app.post("/sessions")
+async def create_session(req: SessionCreateRequest):
+    """Crée une nouvelle session d'animation (lance le process)"""
+    try:
+        # TODO : Implement later a switch case to choose different animator types
+        session = manager.create_session(
+            req.session_id, SimpleFKAnimator, req.animation_file
+        )
+        await session.start()
+        return {"status": "created", "session_id": req.session_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/skeleton")
-async def get_skeleton_definition():
-    """
-    Endpoint REST pour récupérer la structure statique du squelette.
-    Le client doit appeler ceci EN PREMIER pour construire ses objets 3D.
-    """
-    # La méthode get_skeleton_definition a été définie dans skeletalAnimation.py
-    # Elle retourne les noms des os, les parents et la Bind Pose.
-    return anim_data.get_skeleton_definition()
+@app.get("/sessions/{session_id}/skeleton")
+async def get_skeleton(session_id: str):
+    """Récupère le squelette statique pour initialiser le client 3D"""
+    session = manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session.skeleton_structure
 
+
+@app.delete("/sessions/{session_id}")
+async def stop_session(session_id: str):
+    if not manager.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    await manager.delete_session(session_id)
+    return {"status": "deleted"}
+
+
+# --- WEBSOCKET ---
+
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    session = manager.get_session(session_id)
+    if not session:
+        await websocket.close(code=4000, reason="Session does not exist")
+        return
+
+    await session.connect(websocket)
+    try:
+        # On attend juste que la connexion se ferme
+        # Le flux de données est géré par session.broadcast_loop()
+        while True:
+            # On peut écouter des messages du client si besoin (ex: pause, rewind)
+            # data = await websocket.receive_text()
+            # Traitement des commandes client ici...
+
+            # Simple keep-alive ou attente passive
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        session.disconnect(websocket)
+    except Exception as e:
+        print(f"Erreur WS: {e}")
+        session.disconnect(websocket)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -88,9 +154,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # Afficher les stats une fois par seconde
             if current_time - last_print_time >= 1.0:
                 mean_time = (
-                    (total_elapsed / message_count) * 1000
-                    if message_count > 0
-                    else 0
+                    (total_elapsed / message_count) * 1000 if message_count > 0 else 0
                 )
                 print(
                     f"Messages envoyés: {message_count}, Temps moyen: {mean_time:.5f}ms"
@@ -118,7 +182,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Fastest
                 await websocket.send_bytes(pose_bytes)
 
-
             # # On calcule quand doit tomber la PROCHAINE frame
             # next_frame_target += target_frame_time
             #
@@ -144,7 +207,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    import uvicorn
+    # CRITIQUE POUR NUMBA/NUMPY :
+    # Force l'utilisation de 'spawn' au lieu de 'fork' (défaut Linux).
+    # Cela évite les deadlocks si Numba initialise OpenMP avant le fork.
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        # Déjà défini, on ignore
+        pass
 
-    # Lance le serveur sur localhost:8000
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -111,7 +111,7 @@ async def main():
     print("Chargement des animations...")
     # Remplacer par votre fichier BVH ou GLTF
     # anim_data = FastGLTF("assets/character.glb", target_fps=60)
-    anim_data = FastBVH("src/animations/07_01.bvh")
+    anim_data = FastBVH("assets/animations/07_01.bvh")
 
     if anim_data.num_frames == 0:
         print("Erreur: Aucune frame chargée !")
