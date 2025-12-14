@@ -176,7 +176,7 @@ wheels = [
 [[package]]
 name = "momafksolverproject"
 version = "0.1.0"
-source = { editable = "../MoMa FK Solver" }
+source = { editable = "../MoMa_FK_Solver" }
 dependencies = [
     { name = "bvhio" },
     { name = "numba" },
@@ -210,13 +210,15 @@ dependencies = [
     { name = "fastapi" },
     { name = "momafksolverproject" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.124.0" },
-    { name = "momafksolverproject", editable = "../MoMa FK Solver" },
+    { name = "momafksolverproject", editable = "../MoMa_FK_Solver" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.38.0" },
+    { name = "websockets", specifier = ">=15.0.1" },
 ]
 
 [[package]]

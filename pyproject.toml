@@ -8,7 +8,8 @@ dependencies = [
     "fastapi>=0.124.0",
     "momafksolverproject",
     "uvicorn[standard]>=0.38.0",
+    "websockets>=15.0.1",
 ]
 
 [tool.uv.sources]
-momafksolverproject = { path = "../MoMa FK Solver", editable = true }
+momafksolverproject = { path = "../MoMa_FK_Solver", editable = true }

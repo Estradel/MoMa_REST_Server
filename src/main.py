@@ -1,4 +1,6 @@
 import asyncio
+import json
+import struct
 import time
 from pathlib import Path
 
@@ -58,59 +60,80 @@ async def websocket_endpoint(websocket: WebSocket):
     # Chaque client connecté obtient sa propre instance de lecteur (Player).
     # Cela permet à chaque utilisateur d'être à un moment différent de l'anim si besoin,
     # ou d'avoir ses propres paramètres de lecture.
-    player = AnimationPlayer(anim_data)  #
+    player = AnimationPlayer(anim_data)
 
     # On lance la lecture
     player.play()
     player.loop = True
 
-    # Fréquence d'envoi cible (ex: 30 FPS => 0.033s)
-    target_frame_time = 0.033
+    # Configuration 30 FPS
+    target_frame_time = 1.0 / 30.0
+
+    # On initialise le "prochain temps cible"
+    next_frame_target = time.perf_counter()
 
     try:
+        last_time = time.perf_counter()
         last_print_time = time.perf_counter()
         message_count = 0
         total_elapsed = 0.0
 
         while True:
-            start_process = time.perf_counter()
+            current_time = time.perf_counter()
+            elapsed = current_time - last_time
+            message_count += 1
+            total_elapsed += elapsed
+            last_time = current_time
+
+            # Afficher les stats une fois par seconde
+            if current_time - last_print_time >= 1.0:
+                mean_time = (
+                    (total_elapsed / message_count) * 1000
+                    if message_count > 0
+                    else 0
+                )
+                print(
+                    f"Messages envoyés: {message_count}, Temps moyen: {mean_time:.5f}ms"
+                )
+                message_count = 0
+                total_elapsed = 0.0
+                last_print_time = current_time
 
             # 1. Mise à jour du temps interne du player
             player.update()
 
             # 2. Récupération des matrices sous forme de bytes (Zero Copy)
             # Cette méthode a été vue dans animationPlayer.py
+            # pose_bytes = player.get_current_pose()
             pose_bytes = player.get_current_pose_bytes()
 
-            if pose_bytes:
-                elapsed = time.perf_counter() - start_process
-                message_count += 1
-                total_elapsed += elapsed
+            if pose_bytes is not None:
+                # await websocket.send_json(json.dumps({
+                #     'array_data': pose_bytes.tolist()}), mode="text")
 
-                current_time = time.perf_counter()
+                # header : bytes = struct.pack('<III', 0xBADDF00D, 5, 1)
+                # payload : bytes = header + pose_bytes
+                # await websocket.send_bytes(payload)
 
-                # Afficher les stats une fois par seconde
-                if current_time - last_print_time >= 1.0:
-                    mean_time = (
-                        (total_elapsed / message_count) * 1000
-                        if message_count > 0
-                        else 0
-                    )
-                    print(
-                        f"Messages envoyés: {message_count}, Temps moyen: {mean_time:.5f}ms"
-                    )
-                    message_count = 0
-                    total_elapsed = 0.0
-                    last_print_time = current_time
-
-                # 3. Envoi binaire (beaucoup plus performant que JSON pour des matrices)
+                # Fastest
                 await websocket.send_bytes(pose_bytes)
 
-            # 4. Régulation de la boucle (Sleep pour ne pas surcharger le CPU inutilement)
-            # process_duration = time.time() - start_process
-            # sleep_time = max(0.0, target_frame_time - process_duration)
+
+            # # On calcule quand doit tomber la PROCHAINE frame
+            # next_frame_target += target_frame_time
             #
-            # await asyncio.sleep(sleep_time)
+            # now = time.perf_counter()
+            # time_to_wait = next_frame_target - now
+            #
+            # # Si on a beaucoup d'avance (> 2ms), on dort pour économiser le CPU.
+            # # On dort un peu MOINS que prévu (ex: 1.5ms de marge) pour compenser l'imprécision de l'OS.
+            # if time_to_wait > 0.002:
+            #     await asyncio.sleep(time_to_wait - 0.0015)
+            #
+            # # Attente active (Spin-wait) pour la précision finale.
+            # # C'est ce qui garantit le callage parfait sur 33.33ms sans dépasser.
+            # while time.perf_counter() < next_frame_target:
+            #     pass # On ne fait rien, on brûle quelques cycles CPU pour être précis
 
     except WebSocketDisconnect:
         print("Client déconnecté")
