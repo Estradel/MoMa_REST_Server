@@ -9,6 +9,7 @@ from .interfaces import AnimatorInterface
 
 logger = logging.getLogger("SessionManager")
 
+
 class AnimationSession:
     """
     Gère une instance d'animation active :
@@ -16,7 +17,10 @@ class AnimationSession:
     - Lance le processus moteur (CPU)
     - Diffuse les mises à jour aux clients WebSocket (IO)
     """
-    def __init__(self, session_id: str, animator_class: type[AnimatorInterface], source_path: str):
+
+    def __init__(
+        self, session_id: str, animator_class: type[AnimatorInterface], source_path: str
+    ):
         self.session_id = session_id
         self.connections: Set[WebSocket] = set()
 
@@ -34,22 +38,42 @@ class AnimationSession:
 
         # Création du bloc mémoire physique
         self.shm = SharedMemory(create=True, size=total_mem_size)
-        logger.info(f"Session {session_id}: RAM allouée {total_mem_size} bytes (SHM: {self.shm.name})")
+        logger.info(
+            f"Session {session_id}: RAM allouée {total_mem_size} bytes (SHM: {self.shm.name})"
+        )
 
         # 3. Queue légère de synchronisation
         # Ne transporte que des entiers (index 0, 1 ou 2), pas de données lourdes.
         self.queue = multiprocessing.Queue(maxsize=self.buffer_count)
+
+        self.pause_event = multiprocessing.Event()
 
         # 4. Préparation du Moteur (Processus enfant)
         self.engine = AnimationEngine(
             animator_class,
             source_path,
             self.queue,
-            self.shm.name, # On passe le nom pour qu'il puisse s'y attacher
+            self.shm.name,  # On passe le nom pour qu'il puisse s'y attacher
             self.frame_size,
-            self.buffer_count
+            self.pause_event,
+            self.buffer_count,
         )
         self.broadcaster_task = None
+
+    # --- MÉTHODES DE CONTRÔLE ---
+    def pause(self):
+        """Met l'animation en pause"""
+        if not self.pause_event.is_set():
+            self.pause_event.set()
+            logger.info(f"Session {self.session_id} en pause.")
+
+    def play(self):
+        """Reprend l'animation"""
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            logger.info(f"Session {self.session_id} a repris.")
+
+    # ----------------------------
 
     async def start(self):
         """Démarre le calcul et la diffusion"""
@@ -82,10 +106,10 @@ class AnimationSession:
         # Si on oublie ça, la RAM du serveur se remplit indéfiniment (memory leak)
         try:
             self.shm.close()
-            self.shm.unlink() # Demande à l'OS de détruire le fichier mémoire
+            self.shm.unlink()  # Demande à l'OS de détruire le fichier mémoire
             logger.info(f"Mémoire partagée {self.shm.name} libérée.")
         except FileNotFoundError:
-            pass # Déjà nettoyé
+            pass  # Déjà nettoyé
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -119,7 +143,7 @@ class AnimationSession:
                 # starlette/uvicorn gère l'envoi de memoryview efficacement
                 await asyncio.gather(
                     *[client.send_bytes(frame_view) for client in self.connections],
-                    return_exceptions=True
+                    return_exceptions=True,
                 )
 
             except asyncio.CancelledError:
@@ -127,19 +151,24 @@ class AnimationSession:
             except Exception as e:
                 logger.error(f"Erreur broadcast session {self.session_id}: {e}")
 
+
 # ---------------------------------------------------------------------------
 # C'EST ICI QUE JE L'AVAIS OUBLIÉ : La classe SessionManager
 # ---------------------------------------------------------------------------
+
 
 class SessionManager:
     """
     Singleton (ou instance globale) qui garde une référence vers toutes les sessions actives.
     Permet de créer, récupérer et supprimer des sessions depuis l'API REST.
     """
+
     def __init__(self):
         self.sessions: Dict[str, AnimationSession] = {}
 
-    def create_session(self, session_id: str, animator_cls: type[AnimatorInterface], path: str) -> AnimationSession:
+    def create_session(
+        self, session_id: str, animator_cls: type[AnimatorInterface], path: str
+    ) -> AnimationSession:
         """Crée une nouvelle session (mais ne la démarre pas forcément tout de suite)"""
         if session_id in self.sessions:
             raise ValueError(f"La session {session_id} existe déjà.")
@@ -157,3 +186,18 @@ class SessionManager:
             await self.sessions[session_id].stop()
             del self.sessions[session_id]
             logger.info(f"Session {session_id} supprimée du manager.")
+
+    # --- WRAPPERS POUR LE CONTRÔLE ---
+    def pause_session(self, session_id: str):
+        session = self.get_session(session_id)
+        if session:
+            session.pause()
+        else:
+            raise ValueError("Session introuvable")
+
+    def resume_session(self, session_id: str):
+        session = self.get_session(session_id)
+        if session:
+            session.play()
+        else:
+            raise ValueError("Session introuvable")

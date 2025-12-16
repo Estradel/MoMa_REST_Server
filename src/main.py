@@ -10,7 +10,7 @@ from MoMaFkSolver.player import AnimationPlayer
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
-from animators.fk_animator import SimpleFKAnimator
+from animators.fast_fk_animator import FastFKAnimator
 from core.session_manager import SessionManager
 
 # Singleton for session management
@@ -65,7 +65,7 @@ async def create_session(req: SessionCreateRequest):
     try:
         # TODO : Implement later a switch case to choose different animator types
         session = manager.create_session(
-            req.session_id, SimpleFKAnimator, req.animation_file
+            req.session_id, FastFKAnimator, req.animation_file
         )
         await session.start()
         return {"status": "created", "session_id": req.session_id}
@@ -88,6 +88,24 @@ async def stop_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     await manager.delete_session(session_id)
     return {"status": "deleted"}
+
+# --- NOUVELLES ROUTES PLAY / PAUSE ---
+
+@app.post("/sessions/{session_id}/pause")
+async def pause_animation(session_id: str):
+    try:
+        manager.pause_session(session_id)
+        return {"status": "paused", "session_id": session_id}
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session introuvable")
+
+@app.post("/sessions/{session_id}/play")
+async def play_animation(session_id: str):
+    try:
+        manager.resume_session(session_id)
+        return {"status": "playing", "session_id": session_id}
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session introuvable")
 
 
 # --- WEBSOCKET ---

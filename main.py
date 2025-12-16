@@ -5,10 +5,10 @@ import websockets
 import struct
 import json
 import time
-from websockets import ServerConnection
 
 from MoMaFkSolver.core import FastBVH
 from MoMaFkSolver.player import AnimationPlayer
+from websockets import ServerConnection
 
 # --- CONFIGURATION ---
 PORT = 8765

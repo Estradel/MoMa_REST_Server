@@ -20,10 +20,11 @@ class AnimatorInterface(ABC):
         pass
 
     @abstractmethod
-    def write_frame_to_buffer(self, buffer_view: memoryview, offset: int):
+    def write_frame_to_buffer(self, buffer_view: memoryview, offset: int, dt: float):
         """
         Écrit les données de la frame directement dans le buffer mémoire fourni.
         'buffer_view' est une vue sur la mémoire partagée globale.
         'offset' est l'endroit où commencer à écrire.
+        'dt' est le temps écoulé (delta time) ou le pas de temps cible pour cette frame (en secondes).
         """
         pass
