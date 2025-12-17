@@ -121,7 +121,7 @@ async def set_speed(session_id: str, req: SpeedRequest):
     1.0 = normal, 2.0 = x2, 0.5 = x0.5, -1.0 = Marche arrière
     """
     try:
-        manager.set_session_speed(session_id, req.playback_speed)
+        await manager.set_session_speed(session_id, req.playback_speed)
         return {"status": "updated", "session_id": session_id, "speed": req.playback_speed}
     except ValueError:
         raise HTTPException(status_code=404, detail="Session introuvable")

@@ -11,48 +11,159 @@ logger = logging.getLogger("AnimationEngine")
 logger.setLevel(logging.INFO)
 
 
+# noinspection D
 class AnimationEngine(multiprocessing.Process):
     def __init__(
         self,
-        animator_class: type[AnimatorInterface],
+        animator_class,
         source_path: str,
         frame_queue: multiprocessing.Queue,
-        shm_name: str,
-        frame_size: int,
+        command_conn: multiprocessing.connection.Connection,
         pause_event: multiprocessing.Event,
-        playback_speed_value: multiprocessing.Value,
         buffer_count: int = 3,
-        fps: int = 30,
+        fps: int = 60,
     ):
         super().__init__()
         self.animator_class = animator_class
         self.source_path = source_path
         self.frame_queue = frame_queue
-        self.shm_name = shm_name
-        self.frame_size = frame_size
+        self.command_conn = command_conn
+
+        # Note : On ne connaît pas encore le nom de la SHM ni la taille frame
+        self.shm_name = None
+        self.frame_size = 0
+
         self.buffer_count = buffer_count
         self.engine_fps = fps
         self.engine_target_frame_time = 1.0 / self.engine_fps
         self.running = multiprocessing.Event()
-        self.playback_speed_value = playback_speed_value
+        self.playback_speed_value = 1.0
 
         self.pause_event = pause_event
 
-    def run(self):
-        logger.info(f"Moteur démarré (Shared Memory: {self.shm_name})")
-        shm = None
-        try:
-            # 1. Attacher à la mémoire partagée existante
-            shm = SharedMemory(name=self.shm_name)
+    def _wait_for_shm_config(self):
+        """
+        Bloque jusqu'à recevoir le nom de la mémoire partagée depuis le processus parent.
+        """
+        logging.info("Moteur: Attente de la configuration SHM...")
+        while True:
+            if self.command_conn.poll(timeout=10):  # Timeout de sécurité
+                msg = self.command_conn.recv()
+                cmd_name, args, _ = msg
 
-            # 2. Initialiser l'animateur
+                if cmd_name == "set_shm":
+                    self.shm_name = args
+                    return True
+                elif cmd_name == "stop":
+                    return False
+            else:
+                logging.warning("Moteur: Timeout en attente de SHM")
+                return False
+
+    def _process_commands(self, animator):
+        """
+        Vérifie le Pipe. Si des données sont là, on les lit.
+        """
+        # .poll() retourne True immédiatement s'il y a des données, False sinon.
+        # C'est non-bloquant et très rapide.
+        while self.command_conn.poll():
+            try:
+                # Lecture bloquante mais instantanée car poll() a dit ok
+                message = self.command_conn.recv()
+
+                # Format message: (cmd_name, args, expect_response)
+                # expect_response est un booléen pour savoir si on doit renvoyer quelque chose
+                cmd_name, args, expect_response = message
+
+                result = None
+                error = None
+
+                try:
+                    if cmd_name == "seek":
+                        if hasattr(animator, "seek"):
+                            animator.seek(args)
+                        logging.info(f"Moteur: Seek vers {args}s")
+                        result = "ok"
+
+                    elif cmd_name == "set_fps":
+                        self.target_frame_time = 1.0 / float(args)
+                        result = self.target_frame_time
+
+                    elif cmd_name == "get_info":
+                        result = {
+                            "source": self.source_path,
+                            "fps": self.fps,
+                            "shm": self.shm_name,
+                        }
+                        if hasattr(animator, "current_time"):
+                            result["time"] = animator.current_time
+
+                    elif cmd_name == "set_speed":
+                        self.playback_speed_value = float(args)
+                        # logging.info(f"Moteur: Vitesse changée à {self.current_speed}x")
+                        result = self.playback_speed_value
+
+                    else:
+                        error = f"Unknown command: {cmd_name}"
+
+                except Exception as ex:
+                    logging.error(f"Erreur commande {cmd_name}: {ex}")
+                    error = str(ex)
+
+                # --- REPONSE ---
+                # Avec un Pipe Duplex, on renvoie la réponse directement sur la même connexion
+                if expect_response:
+                    self.command_conn.send((result, error))
+
+            except Exception as e:
+                logging.error(f"Erreur critique traitement Pipe: {e}")
+                break
+
+
+    def run(self):
+        animator = None
+        try:
+            # --- PHASE 1 : CHARGEMENT LOURD ---
+            logger.info(f"Moteur: Chargement de {self.source_path}...")
+
             animator = self.animator_class()
             animator.initialize(self.source_path)
 
+            # Récupération des métadonnées
+            skeleton = animator.get_skeleton()
+            self.frame_size = animator.get_memory_size()
+
+            # Envoi du succès au parent via le Pipe
+            # On envoie : (status, data, error)
+            logger.info("Moteur: Chargement terminé. Envoi des métadonnées.")
+            self.command_conn.send(("init_success", {
+                "skeleton": skeleton,
+                "frame_size": self.frame_size
+            }, None))
+
+        except Exception as e:
+            logger.error(f"Erreur d'initialisation Moteur: {e}")
+            self.command_conn.send(("init_error", None, str(e)))
+            return # Arrêt immédiat
+
+
+        # --- PHASE 2 : ATTENTE SHM ---
+        if not self._wait_for_shm_config():
+            logger.error("Moteur: Échec configuration SHM. Arrêt.")
+            return
+
+        # --- PHASE 3 : BOUCLE PRINCIPALE ---
+        shm = None
+        try:
+            logger.info(f"Moteur: Attachement à SHM {self.shm_name}")
+            shm = SharedMemory(name=self.shm_name)
             self.running.set()
             buffer_index = 0
 
             while self.running.is_set():
+                # 1. Commandes via Pipe
+                self._process_commands(animator)
+
                 if self.pause_event.is_set():
                     time.sleep(0.1)
                     continue
@@ -68,7 +179,7 @@ class AnimationEngine(multiprocessing.Process):
                     shm.buf,
                     dt=self.engine_target_frame_time,
                     offset=offset,
-                    playback_speed=self.playback_speed_value.value,
+                    playback_speed=self.playback_speed_value,
                 )
 
                 # 4. Notification

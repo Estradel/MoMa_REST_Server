@@ -1,7 +1,7 @@
 import asyncio
 import multiprocessing
 import logging
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, Any
 from multiprocessing.shared_memory import SharedMemory
 from fastapi import WebSocket
 from .engine import AnimationEngine
@@ -25,42 +25,78 @@ class AnimationSession:
         self.session_id = session_id
         self.connections: Set[WebSocket] = set()
 
-        # 1. Initialisation temporaire pour connaître la taille mémoire requise
-        # On instancie l'animateur juste pour lire ses métadonnées, puis on le jette.
-        temp_animator = animator_class()
-        temp_animator.initialize(source_path)
-        self.skeleton_structure = temp_animator.get_skeleton()
-        self.frame_size = temp_animator.get_memory_size()
-
+        # --- Préparation Infrastructure ---
         # 2. Configuration Mémoire Partagée (Shared Memory)
         # Triple buffering (3 frames d'avance max) pour lisser les pics
         self.buffer_count = 3
-        total_mem_size = self.frame_size * self.buffer_count
-
-        # Création du bloc mémoire physique
-        self.shm = SharedMemory(create=True, size=total_mem_size)
-        logger.info(
-            f"Session {session_id}: RAM allouée {total_mem_size} bytes (SHM: {self.shm.name})"
-        )
-
-        # 3. Queue légère de synchronisation
-        # Ne transporte que des entiers (index 0, 1 ou 2), pas de données lourdes.
         self.queue = multiprocessing.Queue(maxsize=self.buffer_count)
+        self.parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+
+        # VERROU (Lock) : Indispensable pour protéger le Pipe non-thread-safe
+        # lors d'accès concurrents depuis FastAPI
+        self.pipe_lock = asyncio.Lock()
+
         self.pause_event = multiprocessing.Event()
-        self.playback_speed_value = multiprocessing.Value('d', 1.0)
+
+        # Variables qui seront remplies après le démarrage du moteur
+        self.shm = None
+        self.skeleton_structure = None
+        self.frame_size = 0
 
         # 4. Préparation du Moteur (Processus enfant)
         self.engine = AnimationEngine(
             animator_class,
             source_path,
             self.queue,
-            self.shm.name,
-            self.frame_size,
+            child_conn,
             self.pause_event,
-            self.playback_speed_value,
             self.buffer_count,
         )
+
         self.broadcaster_task = None
+
+    async def execute_command(self, cmd_name: str, args: Any = None, wait_for_response: bool = True, timeout: float = 2.0) -> Any:
+        """
+        Envoie une commande via Pipe de manière sécurisée (Lock) et asynchrone.
+        """
+        if not self.engine.is_alive():
+            raise RuntimeError("Moteur arrêté.")
+
+        # On verrouille l'accès au Pipe pour cette session.
+        # Aucune autre commande ne peut passer tant que celle-ci n'est pas finie (Request/Reply).
+        async with self.pipe_lock:
+            try:
+                # 1. Envoi (Send est non-bloquant pour les petites données)
+                # Le tuple contient (cmd, args, expect_response)
+                self.parent_conn.send((cmd_name, args, wait_for_response))
+
+                if not wait_for_response:
+                    return None
+
+                # 2. Attente Réponse (Recv est BLOQUANT -> run_in_executor)
+                loop = asyncio.get_running_loop()
+
+                # On utilise 'poll' avec timeout dans un thread pour éviter de bloquer indéfiniment
+                def receive_with_timeout():
+                    if self.parent_conn.poll(timeout):
+                        return self.parent_conn.recv()
+                    raise TimeoutError("Timeout Pipe")
+
+                result, error = await loop.run_in_executor(None, receive_with_timeout)
+
+                if error:
+                    raise RuntimeError(f"Erreur Moteur: {error}")
+                return result
+
+            except BrokenPipeError:
+                raise RuntimeError("Le Moteur a fermé la connexion (crash probable).")
+            except Exception as e:
+                raise e
+
+    # --- WRAPPERS ---
+    async def get_info(self):
+        return await self.execute_command("get_info", wait_for_response=True)
+
 
     # --- MÉTHODES DE CONTRÔLE ---
     def pause(self):
@@ -75,20 +111,60 @@ class AnimationSession:
             self.pause_event.clear()
             logger.info(f"Session {self.session_id} a repris.")
 
-    def set_speed(self, speed: float):
+    async def set_speed(self, speed: float):
         """Change la vitesse de lecture en temps réel"""
         # Modification atomique (process-safe)
-        self.playback_speed_value.value = speed
+        await self.execute_command("set_speed", speed, wait_for_response=False)
         logger.info(f"Session {self.session_id} vitesse réglée à {speed}x")
 
     # ----------------------------
 
     async def start(self):
-        """Démarre le calcul et la diffusion"""
+        """
+        Démarre le moteur, attend son initialisation, configure la mémoire partagée.
+        """
+        logger.info(f"Session {self.session_id}: Démarrage du moteur...")
         self.engine.start()
 
+        # --- HANDSHAKE D'INITIALISATION ---
+        loop = asyncio.get_running_loop()
+        try:
+            # 1. Attendre que le moteur charge le fichier et renvoie les infos
+            # C'est bloquant pour le Pipe, donc on le met dans un thread
+            def wait_for_init():
+                if self.parent_conn.poll(timeout=30): # Attendre max 10s
+                    return self.parent_conn.recv()
+                raise TimeoutError("Le moteur n'a pas répondu à l'initialisation.")
+
+            msg_type, data, error = await loop.run_in_executor(None, wait_for_init)
+
+            if msg_type == "init_error":
+                raise RuntimeError(f"Le moteur a échoué à charger l'animation : {error}")
+
+            if msg_type != "init_success":
+                raise RuntimeError(f"Réponse moteur invalide : {msg_type}")
+
+            # 2. Récupération des données
+            self.skeleton_structure = data["skeleton"]
+            self.frame_size = data["frame_size"]
+            logger.info(f"Session {self.session_id}: Animation chargée. Taille frame: {self.frame_size} bytes")
+
+            # 3. Création de la Shared Memory
+            total_mem_size = self.frame_size * self.buffer_count
+            self.shm = SharedMemory(create=True, size=total_mem_size)
+            logger.info(f"Session {self.session_id}: SHM créée ({self.shm.name})")
+
+            # 4. Envoi du nom SHM au moteur pour qu'il puisse démarrer la boucle
+            self.parent_conn.send(("set_shm", self.shm.name, False))
+
+        except Exception as e:
+            logger.error(f"Échec démarrage session: {e}")
+            self.engine.terminate() # Tuer le processus s'il est bloqué
+            raise e
+
+        # --- DÉMARRAGE BROADCAST ---
         self.broadcaster_task = asyncio.create_task(self.broadcast_loop())
-        logger.info(f"Session {self.session_id} démarrée.")
+        logger.info(f"Session {self.session_id} entièrement opérationnelle.")
 
     async def stop(self):
         """Arrêt propre et libération des ressources"""
@@ -102,9 +178,19 @@ class AnimationSession:
             except asyncio.CancelledError:
                 pass
 
+        # On prévient le moteur de s'arrêter proprement
+        try:
+            self.parent_conn.send(("stop", None, False))
+        except:
+            pass
+
         # Arrêt du processus moteur
         self.engine.stop()
         self.engine.join(timeout=2)
+
+        # Si ça bloque toujours -> Terminate
+        if self.engine.is_alive():
+            self.engine.terminate()
 
         # Fermeture des WebSockets
         for connection in list(self.connections):
@@ -213,9 +299,9 @@ class SessionManager:
         else:
             raise ValueError("Session introuvable")
 
-    def set_session_speed(self, session_id: str, speed: float):
+    async def set_session_speed(self, session_id: str, speed: float):
         s = self.get_session(session_id)
         if s:
-            s.set_speed(speed)
+            return await s.set_speed(speed)
         else:
             raise ValueError("Session introuvable")
