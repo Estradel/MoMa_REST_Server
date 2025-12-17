@@ -7,6 +7,7 @@ from core.interfaces import AnimatorInterface
 
 
 class FastFKAnimator(AnimatorInterface):
+
     def __init__(self):
         self.anim_data: FastFkSolver = None
         self.t = 0.0
@@ -14,6 +15,18 @@ class FastFKAnimator(AnimatorInterface):
         # 16 floats (matrice 4x4) * 4 octets (float32)
         self.bone_size_bytes = 4 * 4 * np.dtype(np.float64).itemsize
         self.total_size = self.num_bones * self.bone_size_bytes
+
+    @property
+    def animator_fps(self):
+        if self.anim_data is not None:
+            return 1.0 / self.anim_data.frame_time
+        return 30.0
+
+    @property
+    def animator_frametime(self):
+        if self.anim_data is not None:
+            return self.anim_data.frame_time
+        return 1.0 / 30.0
 
     def initialize(self, source_path: str):
         self.anim_data = FastBVH(source_path)
@@ -26,10 +39,10 @@ class FastFKAnimator(AnimatorInterface):
     def get_memory_size(self) -> int:
         return self.total_size
 
-    def write_frame_to_buffer(self, buffer_view: memoryview, offset: int, dt: float):
+    def write_frame_to_buffer(self, buffer_view: memoryview, offset: int, dt: float, playback_speed: float = 1.0):
         # --- UTILISATION DU DT ---
         # On incrémente le temps interne de l'animation avec la valeur précise reçue du moteur
-        self.t += dt
+        self.t += dt * playback_speed
 
         target_array = np.ndarray(
             shape=(self.num_bones, 4, 4),

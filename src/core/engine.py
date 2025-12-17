@@ -30,12 +30,11 @@ class AnimationEngine(multiprocessing.Process):
         self.shm_name = shm_name
         self.frame_size = frame_size
         self.buffer_count = buffer_count
-        self.fps = fps
+        self.engine_fps = fps
+        self.engine_target_frame_time = 1.0 / self.engine_fps
         self.running = multiprocessing.Event()
-        self.target_frame_time = 1.0 / self.fps
 
         self.pause_event = pause_event
-
 
     def run(self):
         logger.info(f"Moteur démarré (Shared Memory: {self.shm_name})")
@@ -63,7 +62,12 @@ class AnimationEngine(multiprocessing.Process):
 
                 # 3. Écriture DIRECTE (Zero-Copy)
                 # L'animateur écrit ses floats directement dans la RAM partagée
-                animator.write_frame_to_buffer(shm.buf, offset, self.target_frame_time)
+                animator.write_frame_to_buffer(
+                    shm.buf,
+                    dt=self.engine_target_frame_time,
+                    offset=offset,
+                    playback_speed=1.0,
+                )
 
                 # 4. Notification
                 # On envoie juste l'index (un simple int), c'est instantané.
@@ -74,7 +78,7 @@ class AnimationEngine(multiprocessing.Process):
 
                 # 5. Timing
                 elapsed = time.perf_counter() - start_time
-                sleep_time = self.target_frame_time - elapsed
+                sleep_time = self.engine_target_frame_time - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
@@ -85,7 +89,6 @@ class AnimationEngine(multiprocessing.Process):
             if shm:
                 shm.close()  # Détacher, mais ne pas unlink (le manager le fera)
             logger.info("Arrêt moteur.")
-
 
     def stop(self):
         self.running.clear()
