@@ -46,17 +46,18 @@ class AnimationSession:
         # 3. Queue légère de synchronisation
         # Ne transporte que des entiers (index 0, 1 ou 2), pas de données lourdes.
         self.queue = multiprocessing.Queue(maxsize=self.buffer_count)
-
         self.pause_event = multiprocessing.Event()
+        self.playback_speed_value = multiprocessing.Value('d', 1.0)
 
         # 4. Préparation du Moteur (Processus enfant)
         self.engine = AnimationEngine(
             animator_class,
             source_path,
             self.queue,
-            self.shm.name,  # On passe le nom pour qu'il puisse s'y attacher
+            self.shm.name,
             self.frame_size,
             self.pause_event,
+            self.playback_speed_value,
             self.buffer_count,
         )
         self.broadcaster_task = None
@@ -73,6 +74,12 @@ class AnimationSession:
         if self.pause_event.is_set():
             self.pause_event.clear()
             logger.info(f"Session {self.session_id} a repris.")
+
+    def set_speed(self, speed: float):
+        """Change la vitesse de lecture en temps réel"""
+        # Modification atomique (process-safe)
+        self.playback_speed_value.value = speed
+        logger.info(f"Session {self.session_id} vitesse réglée à {speed}x")
 
     # ----------------------------
 
@@ -203,5 +210,12 @@ class SessionManager:
         session = self.get_session(session_id)
         if session:
             session.play()
+        else:
+            raise ValueError("Session introuvable")
+
+    def set_session_speed(self, session_id: str, speed: float):
+        s = self.get_session(session_id)
+        if s:
+            s.set_speed(speed)
         else:
             raise ValueError("Session introuvable")

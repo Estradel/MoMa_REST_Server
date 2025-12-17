@@ -20,6 +20,7 @@ class AnimationEngine(multiprocessing.Process):
         shm_name: str,
         frame_size: int,
         pause_event: multiprocessing.Event,
+        playback_speed_value: multiprocessing.Value,
         buffer_count: int = 3,
         fps: int = 30,
     ):
@@ -33,6 +34,7 @@ class AnimationEngine(multiprocessing.Process):
         self.engine_fps = fps
         self.engine_target_frame_time = 1.0 / self.engine_fps
         self.running = multiprocessing.Event()
+        self.playback_speed_value = playback_speed_value
 
         self.pause_event = pause_event
 
@@ -66,7 +68,7 @@ class AnimationEngine(multiprocessing.Process):
                     shm.buf,
                     dt=self.engine_target_frame_time,
                     offset=offset,
-                    playback_speed=1.0,
+                    playback_speed=self.playback_speed_value.value,
                 )
 
                 # 4. Notification
